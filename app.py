@@ -1,258 +1,307 @@
 #!/usr/bin/env python3
-"""Fa'aoga Pygame ma ttsmms mo le talosaga TTS."""
-
-import pygame
-import pygame.scrap
-import uuid
-import re
-import os
-import soundfile as sf
+import pygame, uuid, re, os, soundfile as sf
 from ttsmms import TTS
 
-# ── Seti Pygame ─────────────────────────────────────────────────────────────
 pygame.init()
+
+WIDTH, HEIGHT = 600, 360
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("REA TTS GUI")
+
+# ── now that a window exists, init clipboard ───────────────────────────
 pygame.scrap.init()
-WIDTH, HEIGHT = 800, 600
-screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
-pygame.display.set_caption("REA TTS")
-FONT = pygame.font.SysFont("sans", 20)
+pygame.scrap.set_mode(pygame.SCRAP_CLIPBOARD)
+
+FONT  = pygame.font.SysFont("sans", 20)
 clock = pygame.time.Clock()
 
-# ── Lanu ma foliga ─────────────────────────────────────────────────────────-
-FG = (255, 255, 255)
-BG_COLOR = (30, 30, 30)
+CURSOR_BLINK_MS = 500
+SCROLLBAR_W, MIN_SLIDER_H = 12, 20
 
-# ── Vasega Pusa Ulufale ─────────────────────────────────────────────────────
-class InputBox:
-    def __init__(self, x, y, w, h, text=""):
+# ── GUI widgets ──────────────────────────────────────────────────────────
+class ScrollableInputBox:
+    def __init__(self, x, y, w, h, text=''):
         self.rect = pygame.Rect(x, y, w, h)
-        self.text = text
-        self.active = False
-        self.cursor_vis = True
-        self.cursor_timer = 0
+        self.inner_w, self.inner_h = w - SCROLLBAR_W - 6, h - 6
+        self.text, self.cursor_pos = text, len(text)
+        self.active, self.scroll = False, 0
+        self.dragging_bar, self.drag_offset_px = False, 0
+        self.last_blink, self.cursor_visible = pygame.time.get_ticks(), True
+        self.sel_start = self.sel_end = None
+        self.lines, self.line_starts = [], []
+        self.slider_rect = pygame.Rect(0, 0, 0, 0)
 
+    # ---------- helpers --------------------------------------------------
+    def has_sel(self):      return self.sel_start is not None and self.sel_start != self.sel_end
+    def clear_sel(self):    self.sel_start = self.sel_end = None
+
+    def wrap_text(self):
+        self.lines, self.line_starts = [], []
+        idx = 0
+        for para in self.text.split('\n'):
+            cur = ''
+            for word in para.split(' '):
+                nxt = (cur + ' ' + word) if cur else word
+                if FONT.size(nxt)[0] <= self.inner_w:
+                    cur = nxt
+                else:
+                    self.lines.append(cur)
+                    self.line_starts.append(idx)
+                    idx += len(cur) + 1
+                    cur = word
+            self.lines.append(cur)
+            self.line_starts.append(idx)
+            idx += len(cur) + 1
+        if self.line_starts:
+            self.line_starts[-1] = len(self.text) - len(self.lines[-1])
+
+    def visible_lines(self): return self.inner_h // FONT.get_height()
+    def clamp_scroll(self):
+        self.scroll = max(0, min(self.scroll,
+                        max(0, len(self.lines) - self.visible_lines())))
+
+    def update_cursor_blink(self):
+        if pygame.time.get_ticks() - self.last_blink >= CURSOR_BLINK_MS:
+            self.cursor_visible = not self.cursor_visible
+            self.last_blink = pygame.time.get_ticks()
+
+    # ---------- event handling ------------------------------------------
     def handle_event(self, event):
         if event.type == pygame.MOUSEBUTTONDOWN:
-            self.active = self.rect.collidepoint(event.pos)
-        if event.type == pygame.KEYDOWN and self.active:
-            if event.mod & pygame.KMOD_CTRL:
-                if event.key == pygame.K_c:
-                    pygame.scrap.put(pygame.SCRAP_TEXT, self.text.encode())
-                elif event.key == pygame.K_v:
-                    clip = pygame.scrap.get(pygame.SCRAP_TEXT)
-                    if clip:
-                        self.text += clip.decode()
-            elif event.key == pygame.K_BACKSPACE:
-                self.text = self.text[:-1]
-            elif event.key == pygame.K_RETURN:
-                pass
+            if self.slider_rect.collidepoint(event.pos):
+                self.dragging_bar = True
+                self.drag_offset_px = event.pos[1] - self.slider_rect.y
             else:
-                self.text += event.unicode
+                self.active = self.rect.collidepoint(event.pos)
+                if self.active:
+                    self.clear_sel()
+                    cx, cy = event.pos[0] - self.rect.x - 3, event.pos[1] - self.rect.y - 3
+                    line_i = self.scroll + cy // FONT.get_height()
+                    if 0 <= line_i < len(self.lines):
+                        col = 0
+                        for col in range(len(self.lines[line_i]) + 1):
+                            if FONT.size(self.lines[line_i][:col])[0] >= cx:
+                                break
+                        self.cursor_pos = self.line_starts[line_i] + col
+                        self.cursor_visible = True
+                        self.last_blink = pygame.time.get_ticks()
 
-    def update(self):
-        self.cursor_timer += 1
-        if self.cursor_timer >= 30:
-            self.cursor_timer = 0
-            self.cursor_vis = not self.cursor_vis
+        elif event.type == pygame.MOUSEBUTTONUP:
+            self.dragging_bar = False
 
-    def draw(self, surf):
-        box_surf = pygame.Surface((self.rect.w, self.rect.h), pygame.SRCALPHA)
-        box_surf.fill((40, 40, 40, 150))
-        pygame.draw.rect(box_surf, FG, box_surf.get_rect(), 2, border_radius=10)
-        surf.blit(box_surf, self.rect.topleft)
-        txt = FONT.render(self.text, True, FG)
-        surf.blit(txt, (self.rect.x + 5, self.rect.y + 5))
-        if self.active and self.cursor_vis:
-            x = self.rect.x + 5 + txt.get_width() + 1
-            pygame.draw.line(surf, FG, (x, self.rect.y + 5), (x, self.rect.y + self.rect.h - 5), 2)
+        elif event.type == pygame.MOUSEMOTION and self.dragging_bar:
+            track = self.rect.h
+            bar_h = self.slider_rect.h
+            max_start = max(0, len(self.lines) - self.visible_lines())
+            if max_start:
+                new_y = max(self.rect.y,
+                            min(event.pos[1] - self.drag_offset_px,
+                                self.rect.y + track - bar_h))
+                self.slider_rect.y = new_y
+                self.scroll = int((new_y - self.rect.y) /
+                                  (track - bar_h) * max_start)
 
-    def get(self):
-        return self.text.strip()
-
-# ── Vasega Pusa Tusitusiga ──────────────────────────────────────────────────
-class TextBox:
-    def __init__(self, x, y, w, h, text=""):
-        self.rect = pygame.Rect(x, y, w, h)
-        self.text = text
-        self.active = False
-        self.cursor = len(text)
-        self.cursor_vis = True
-        self.cursor_timer = 0
-        self.scroll = 0
-
-    def handle_event(self, event):
-        if event.type == pygame.MOUSEBUTTONDOWN:
-            self.active = self.rect.collidepoint(event.pos)
         elif event.type == pygame.MOUSEWHEEL and self.active:
             self.scroll -= event.y
-            self.scroll = max(0, min(self.scroll, self.max_scroll()))
+            self.clamp_scroll()
+
         elif event.type == pygame.KEYDOWN and self.active:
-            if event.mod & pygame.KMOD_CTRL:
-                if event.key == pygame.K_c:
-                    pygame.scrap.put(pygame.SCRAP_TEXT, self.text.encode())
-                elif event.key == pygame.K_v:
-                    clip = pygame.scrap.get(pygame.SCRAP_TEXT)
-                    if clip:
-                        self.insert(clip.decode())
-            elif event.key == pygame.K_BACKSPACE:
-                if self.cursor > 0:
-                    self.text = self.text[:self.cursor-1] + self.text[self.cursor:]
-                    self.cursor -= 1
-            elif event.key == pygame.K_RETURN:
-                self.insert("\n")
-            elif event.key == pygame.K_LEFT:
-                self.cursor = max(0, self.cursor - 1)
-            elif event.key == pygame.K_RIGHT:
-                self.cursor = min(len(self.text), self.cursor + 1)
-            elif event.key == pygame.K_UP:
-                self.move_cursor_vert(-1)
-            elif event.key == pygame.K_DOWN:
-                self.move_cursor_vert(1)
+            ctrl = pygame.key.get_mods() & pygame.KMOD_CTRL
+            # ----- clipboard combos -------------------------------------
+            if ctrl and event.key == pygame.K_a:           # select-all
+                self.sel_start, self.sel_end = 0, len(self.text)
+                self.cursor_pos = self.sel_end
+            elif ctrl and event.key == pygame.K_c:         # copy
+                data = (self.text[self.sel_start:self.sel_end]
+                        if self.has_sel() else self.text)
+                pygame.scrap.put(pygame.SCRAP_TEXT, data.encode())
+            elif ctrl and event.key == pygame.K_x:         # cut
+                if self.has_sel():
+                    pygame.scrap.put(pygame.SCRAP_TEXT,
+                                     self.text[self.sel_start:self.sel_end].encode())
+                    start, end = sorted((self.sel_start, self.sel_end))
+                    self.text = self.text[:start] + self.text[end:]
+                    self.cursor_pos = start
+                    self.clear_sel()
+            elif ctrl and event.key == pygame.K_v:         # paste
+                clip = pygame.scrap.get(pygame.SCRAP_TEXT)
+                if clip:
+                    clip = clip.decode('utf-8', 'ignore')
+                    if self.has_sel():
+                        start, end = sorted((self.sel_start, self.sel_end))
+                        self.text = self.text[:start] + clip + self.text[end:]
+                        self.cursor_pos = start + len(clip)
+                        self.clear_sel()
+                    else:
+                        self.text = (self.text[:self.cursor_pos] + clip +
+                                     self.text[self.cursor_pos:])
+                        self.cursor_pos += len(clip)
+
+            # ----- editing / nav ---------------------------------------
             else:
-                if event.unicode:
-                    self.insert(event.unicode)
+                if self.has_sel() and event.key not in (
+                        pygame.K_LEFT, pygame.K_RIGHT,
+                        pygame.K_UP, pygame.K_DOWN,
+                        pygame.K_LSHIFT, pygame.K_RSHIFT):
+                    start, end = sorted((self.sel_start, self.sel_end))
+                    self.text = self.text[:start] + self.text[end:]
+                    self.cursor_pos = start
+                    self.clear_sel()
 
-    def insert(self, char: str) -> None:
-        self.text = self.text[:self.cursor] + char + self.text[self.cursor:]
-        self.cursor += len(char)
+                if event.key == pygame.K_BACKSPACE and self.cursor_pos > 0:
+                    self.text = (self.text[:self.cursor_pos - 1] +
+                                 self.text[self.cursor_pos:])
+                    self.cursor_pos -= 1
+                elif event.key == pygame.K_DELETE and self.cursor_pos < len(self.text):
+                    self.text = self.text[:self.cursor_pos] + self.text[self.cursor_pos + 1:]
+                elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    self.text = (self.text[:self.cursor_pos] + '\n' +
+                                 self.text[self.cursor_pos:])
+                    self.cursor_pos += 1
+                elif event.key == pygame.K_LEFT and self.cursor_pos > 0:
+                    self.cursor_pos -= 1; self.clear_sel()
+                elif event.key == pygame.K_RIGHT and self.cursor_pos < len(self.text):
+                    self.cursor_pos += 1; self.clear_sel()
+                elif event.key == pygame.K_UP:
+                    self.move_vert(-1); self.clear_sel()
+                elif event.key == pygame.K_DOWN:
+                    self.move_vert(+1); self.clear_sel()
+                elif event.unicode and not ctrl:
+                    self.text = (self.text[:self.cursor_pos] + event.unicode +
+                                 self.text[self.cursor_pos:])
+                    self.cursor_pos += len(event.unicode)
 
-    def move_cursor_vert(self, direction: int) -> None:
-        line_idx, col = self.index_to_linecol(self.cursor)
-        lines = self.text.split("\n")
-        line_idx = max(0, min(len(lines) - 1, line_idx + direction))
-        col = min(len(lines[line_idx]), col)
-        self.cursor = self.linecol_to_index(line_idx, col)
+            self.cursor_visible = True
+            self.last_blink = pygame.time.get_ticks()
 
-    def index_to_linecol(self, idx: int):
-        lines = self.text.split("\n")
-        cur = 0
-        for i, line in enumerate(lines):
-            if idx <= cur + len(line):
-                return i, idx - cur
-            cur += len(line) + 1
-        return len(lines) - 1, len(lines[-1])
-
-    def linecol_to_index(self, line: int, col: int) -> int:
-        lines = self.text.split("\n")
-        idx = 0
-        for i in range(line):
-            idx += len(lines[i]) + 1
-        return idx + col
-
-    def max_scroll(self) -> int:
-        lines = self.text.split("\n")
-        vis = self.rect.h // FONT.get_linesize()
-        return max(0, len(lines) - vis)
-
-    def update(self):
-        self.cursor_timer += 1
-        if self.cursor_timer >= 30:
-            self.cursor_timer = 0
-            self.cursor_vis = not self.cursor_vis
-        line_idx, _ = self.index_to_linecol(self.cursor)
-        vis = self.rect.h // FONT.get_linesize()
-        if line_idx < self.scroll:
-            self.scroll = line_idx
-        elif line_idx >= self.scroll + vis:
-            self.scroll = line_idx - vis + 1
-
-    def draw(self, surf):
-        box_surf = pygame.Surface((self.rect.w, self.rect.h), pygame.SRCALPHA)
-        box_surf.fill((40, 40, 40, 150))
-        pygame.draw.rect(box_surf, FG, box_surf.get_rect(), 2, border_radius=10)
-        surf.blit(box_surf, self.rect.topleft)
-        lines = self.text.split("\n")
-        vis = self.rect.h // FONT.get_linesize()
-        for i in range(vis):
-            idx = self.scroll + i
-            if idx >= len(lines):
+    def move_vert(self, direction):
+        line_i = 0
+        for i, start in enumerate(self.line_starts):
+            if start <= self.cursor_pos < start + len(self.lines[i]):
+                line_i = i
                 break
-            txt = FONT.render(lines[idx], True, FG)
-            surf.blit(txt, (self.rect.x + 5, self.rect.y + 5 + i * FONT.get_linesize()))
-        if self.active and self.cursor_vis:
-            line_idx, col = self.index_to_linecol(self.cursor)
-            if self.scroll <= line_idx < self.scroll + vis:
-                cursor_x = self.rect.x + 5 + FONT.size(lines[line_idx][:col])[0]
-                cursor_y = self.rect.y + 5 + (line_idx - self.scroll) * FONT.get_linesize()
-                pygame.draw.line(surf, FG, (cursor_x, cursor_y), (cursor_x, cursor_y + FONT.get_linesize()), 2)
+        col = self.cursor_pos - self.line_starts[line_i]
+        new = line_i + direction
+        if 0 <= new < len(self.lines):
+            self.cursor_pos = self.line_starts[new] + min(col, len(self.lines[new]))
+            if new < self.scroll:
+                self.scroll = new
+            elif new >= self.scroll + self.visible_lines():
+                self.scroll = new - self.visible_lines() + 1
 
-# ── Vasega Faamau ───────────────────────────────────────────────────────────
-class Button:
-    def __init__(self, text: str, x: int, y: int, callback):
-        self.text = text
-        self.callback = callback
-        self.rect = pygame.Rect(x, y, 120, 40)
-        self.txt = FONT.render(text, True, FG)
-
-    def handle_event(self, event):
-        if event.type == pygame.MOUSEBUTTONDOWN and self.rect.collidepoint(event.pos):
-            self.callback()
+    # ---------- frame update & draw -------------------------------------
+    def update(self):
+        self.wrap_text(); self.clamp_scroll(); self.update_cursor_blink()
+        vis, total = self.visible_lines(), max(len(self.lines), 1)
+        bar_h = max(int(self.rect.h * vis / total), MIN_SLIDER_H)
+        max_start = max(0, total - vis)
+        self.slider_rect = pygame.Rect(
+            self.rect.right - SCROLLBAR_W,
+            self.rect.y if max_start == 0
+            else self.rect.y + int(self.scroll / max_start * (self.rect.h - bar_h)),
+            SCROLLBAR_W, bar_h)
 
     def draw(self, surf):
-        pygame.draw.rect(surf, (100, 100, 100, 180), self.rect, border_radius=10)
-        pygame.draw.rect(surf, FG, self.rect, 2, border_radius=10)
+        pygame.draw.rect(surf, (230,230,230), self.rect, border_radius=3)
+        pygame.draw.rect(surf, (30,144,255) if self.active else (180,180,180),
+                         self.rect, 2, border_radius=3)
+
+        line_h = FONT.get_height()
+        base_x, base_y = self.rect.x + 3, self.rect.y + 3
+
+        # selection highlight
+        if self.has_sel():
+            s0, s1 = sorted((self.sel_start, self.sel_end))
+            for i in range(self.visible_lines()):
+                idx = self.scroll + i
+                if idx >= len(self.lines): break
+                lstart = self.line_starts[idx]
+                lend   = lstart + len(self.lines[idx])
+                if lend <= s0 or lstart >= s1: continue
+                st_in  = max(s0, lstart) - lstart
+                en_in  = min(s1, lend)   - lstart
+                x0 = base_x + FONT.size(self.lines[idx][:st_in])[0]
+                x1 = base_x + FONT.size(self.lines[idx][:en_in])[0]
+                y  = base_y + i * line_h
+                pygame.draw.rect(surf, (173,216,230), (x0, y, x1 - x0, line_h))
+
+        # text
+        for i in range(self.visible_lines()):
+            idx = self.scroll + i
+            if idx >= len(self.lines): break
+            surf.blit(FONT.render(self.lines[idx], True, (0,0,0)),
+                      (base_x, base_y + i * line_h))
+
+        # caret
+        if self.active and self.cursor_visible:
+            cur_line = 0
+            for i, s in enumerate(self.line_starts):
+                if s <= self.cursor_pos < s + len(self.lines[i]):
+                    cur_line = i; break
+            if self.scroll <= cur_line < self.scroll + self.visible_lines():
+                col = self.cursor_pos - self.line_starts[cur_line]
+                cx  = base_x + FONT.size(self.lines[cur_line][:col])[0]
+                cy  = base_y + (cur_line - self.scroll) * line_h
+                pygame.draw.line(surf, (0,0,0), (cx, cy), (cx, cy + line_h))
+
+        # scrollbar
+        if len(self.lines) > self.visible_lines():
+            pygame.draw.rect(surf, (200,200,200),
+                (self.rect.right - SCROLLBAR_W, self.rect.y,
+                 SCROLLBAR_W, self.rect.h))
+            pygame.draw.rect(surf, (100,100,100), self.slider_rect)
+
+    def get(self): return self.text.strip()
+
+class Button:
+    def __init__(self, label, x, y, fn):
+        self.rect = pygame.Rect(x, y, 120, 40)
+        self.fn   = fn
+        self.txt  = FONT.render(label, True, (0,0,0))
+    def handle_event(self, e):
+        if e.type == pygame.MOUSEBUTTONDOWN and self.rect.collidepoint(e.pos):
+            self.fn()
+    def draw(self, surf):
+        pygame.draw.rect(surf, (200,200,200), self.rect, border_radius=4)
         surf.blit(self.txt, (self.rect.x + 15, self.rect.y + 10))
 
-# ── Galuega TTS ─────────────────────────────────────────────────────────────
-def fai_tautala(kode: str, tusitusiga: str, sefe: bool = False) -> None:
-    """Fai le tautala po'o le sefe o le faila."""
-    if not tusitusiga or not kode:
-        print("Leai ni faamaumauga.")
-        return
-    print(f"Fakagao te reqo: {tusitusiga}")
+# ── Speak logic (unchanged) --------------------------------------------
+def speak(code, text, save=False):
+    if not text or not code: return print("Missing input.")
     try:
-        tts = TTS(kode)
-        out = tts.synthesis(tusitusiga)
-        wav = f"{re.sub(r'[^\w\-]+', '_', tusitusiga) or 'clip'}_{uuid.uuid4().hex[:8]}.wav"
-        if sefe:
-            sf.write(wav, out["x"], out["sampling_rate"])
-            print(f"Ua sefe i le {wav}")
-        else:
-            wav = "_temp.wav"
-            sf.write(wav, out["x"], out["sampling_rate"])
-        if os.name == "nt":
-            os.system(f"powershell -c (New-Object Media.SoundPlayer '{wav}').PlaySync()")
-        else:
-            os.system(f"aplay '{wav}'")
+        out = TTS(code).synthesis(text)
+        name = (re.sub(r'\W+', '_', text) or 'clip') + '_' + uuid.uuid4().hex[:8] + '.wav'
+        if not save: name = "_temp.wav"
+        sf.write(name, out['x'], out['sampling_rate'])
+        os.system(f"powershell -c (New-Object Media.SoundPlayer '{name}').PlaySync()"
+                  if os.name == 'nt' else f"aplay '{name}'")
     except Exception as e:
-        print(f"Sese: {e}")
+        print("Error:", e)
 
-# ── Fausiaina o Mea UI ─────────────────────────────────────────────────────
-lang_box = InputBox(50, 40, 200, 32, text="tha")
-text_box = TextBox(50, 100, 700, 300, text="Pisa tusitusiga iinei")
-speak_btn = Button("Fa'alogo", 200, HEIGHT - 60, lambda: fai_tautala(lang_box.get(), text_box.text, False))
-save_btn = Button("Sefe", 360, HEIGHT - 60, lambda: fai_tautala(lang_box.get(), text_box.text, True))
+# ── Build UI -----------------------------------------------------------
+lang_box = ScrollableInputBox(200, 25, 200, 34, 'tha')
+text_box = ScrollableInputBox(50, 85, 500, 180, 'พิมพ์ข้อความที่นี่')
+btn_speak = Button("Speak", 150, 280, lambda: speak(lang_box.get(), text_box.get(), False))
+btn_save  = Button("Save",  330, 280, lambda: speak(lang_box.get(), text_box.get(), True))
 
-input_boxes = [lang_box, text_box]
-buttons = [speak_btn, save_btn]
+widgets = [lang_box, text_box]
+buttons = [btn_speak, btn_save]
 
-# ── Ta'amilosaga Autu ──────────────────────────────────────────────────────
+# ── Main loop ----------------------------------------------------------
 running = True
 while running:
-    screen.fill(BG_COLOR)
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
+    screen.fill((255,255,255))
+    screen.blit(FONT.render("Language Code:", True, (0,0,0)), (50, 30))
+    screen.blit(FONT.render("Text to Speak:", True, (0,0,0)), (50, 60))
+
+    for e in pygame.event.get():
+        if e.type == pygame.QUIT:
             running = False
-        elif event.type == pygame.VIDEORESIZE:
-            WIDTH, HEIGHT = event.w, event.h
-            screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
-            speak_btn.rect.topleft = (200, HEIGHT - 60)
-            save_btn.rect.topleft = (360, HEIGHT - 60)
-        for box in input_boxes:
-            box.handle_event(event)
-        for b in buttons:
-            b.handle_event(event)
+        for w in widgets: w.handle_event(e)
+        for b in buttons: b.handle_event(e)
 
-    for box in input_boxes:
-        box.update()
-        box.draw(screen)
-    for b in buttons:
-        b.draw(screen)
-
-    label1 = FONT.render("Tulafono o le gagana:", True, FG)
-    screen.blit(label1, (50, 15))
-    label2 = FONT.render("Tusitusiga e tautala:", True, FG)
-    screen.blit(label2, (50, 75))
+    for w in widgets: w.update(); w.draw(screen)
+    for b in buttons: b.draw(screen)
 
     pygame.display.flip()
     clock.tick(30)
